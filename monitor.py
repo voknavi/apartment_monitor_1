@@ -21,7 +21,7 @@ CONFIG = {
     "data_file": "seen_ads.json",
     "log_file": "monitor.log",
     "telegram_token": "",       # from @BotFather
-    "telegram_chat_ids": [],     # from @userinfobot
+    "telegram_chat_ids": "",     # from @userinfobot
     "desktop_notifications": True,
     "browser_headless": True,
     "browser_timeout": 30000,
@@ -176,55 +176,56 @@ def fetch_kufar_browser(site: dict, context) -> list[dict]:
 #   __NEXT_DATA__ -> props -> pageProps -> objects  (list of 30)
 
 def parse_realt_object(obj: dict) -> dict | None:
-    ad_id = str(obj.get("id", obj.get("uuid", obj.get("slug", ""))))
+    # Unique numeric code used in URLs (e.g. 4150946)
+    code = obj.get("code")
+    uuid = obj.get("uuid", "")
+    ad_id = str(code or uuid)
     if not ad_id:
         return None
 
-    # URL
-    url = obj.get("url") or obj.get("link") or ""
-    if not url:
-        slug = obj.get("slug", ad_id)
-        url = f"https://realt.by/rent/flat-for-long/{slug}/"
-    if not url.startswith("http"):
-        url = f"https://realt.by{url}"
-
-    # Title: rooms + address
-    rooms = (obj.get("roomsCount") or obj.get("rooms")
-             or obj.get("numberOfRooms") or obj.get("bedroomsCount"))
-    addr = (obj.get("address") or obj.get("userAddress")
-            or (obj.get("location") or {}).get("address", ""))
-    if rooms and addr:
-        title = f"{rooms}-комн., {addr}"
-    elif rooms:
-        title = f"{rooms}-комн."
-    elif addr:
-        title = addr
+    # Correct URL pattern confirmed from real data
+    if code:
+        url = f"https://realt.by/rent-flat-for-long/object/{code}/"
     else:
-        title = obj.get("name") or obj.get("title") or "Квартира"
+        url = f"https://realt.by/rent-flat-for-long/object/{uuid}/"
 
-    # Price
-    price_raw = obj.get("price") or obj.get("priceData") or {}
+    # Title: rooms + address + floor
+    rooms = obj.get("rooms")
+    addr = obj.get("address", "")
+    storey = obj.get("storey")
+    storeys = obj.get("storeys")
+
+    parts = []
+    if rooms:
+        parts.append(f"{rooms}-комн.")
+    if addr:
+        parts.append(addr)
+    if storey and storeys:
+        parts.append(f"{storey}/{storeys} эт.")
+    title = ", ".join(parts) if parts else "Квартира"
+
+    # Price: priceRates has currency codes as keys
+    # 840=USD, 933=BYN, 978=EUR
     price_str = "—"
-    if isinstance(price_raw, dict):
-        # Try USD directly
-        usd = (price_raw.get("USD") or price_raw.get("usd")
-               or price_raw.get("amount"))
+    rates = obj.get("priceRates") or {}
+    if isinstance(rates, dict):
+        usd = rates.get("840")   # USD
+        eur = rates.get("978")   # EUR
+        byn = rates.get("933")   # BYN
         if usd:
             price_str = f"${usd}/мес"
-        else:
-            # Sometimes nested: price.prices[{currency,amount}]
-            for entry in price_raw.get("prices", []):
-                if isinstance(entry, dict) and entry.get("currency") in ("USD", "usd"):
-                    price_str = f"${entry['amount']}/мес"
-                    break
-            if price_str == "—":
-                # Take any amount available
-                amt = price_raw.get("amount") or price_raw.get("value")
-                cur = price_raw.get("currency", "")
-                if amt:
-                    price_str = f"{amt} {cur}".strip()
-    elif isinstance(price_raw, (int, float, str)):
-        price_str = str(price_raw)
+        elif eur:
+            price_str = f"€{eur}/мес"
+        elif byn:
+            price_str = f"{byn} BYN/мес"
+    # Fallback: direct price field
+    if price_str == "—":
+        amount = obj.get("price")
+        currency = obj.get("priceCurrency")
+        if amount:
+            cur_map = {840: "$", 933: " BYN", 978: "€"}
+            cur_sym = cur_map.get(currency, "")
+            price_str = f"{cur_sym}{amount}/мес" if cur_sym == "$" or cur_sym == "€" else f"{amount}{cur_sym}/мес"
 
     return {
         "id": f"realt_{ad_id}",
@@ -369,16 +370,16 @@ def notify_desktop(title: str, message: str):
 def notify_telegram(ad: dict):
     token = CONFIG.get("telegram_token", "").strip()
     chat_ids = CONFIG.get("telegram_chat_ids", [])
+    
+    # Обратная совместимость: если список пуст, попробовать telegram_chat_id (строка)
+    if not chat_ids:
+        single = CONFIG.get("telegram_chat_id", "").strip()
+        if single:
+            chat_ids = [single]
+    
     if not token or not chat_ids:
-        # Для обратной совместимости — если вдруг остался старый ключ telegram_chat_id
-        if not token:
-            return
-        old_chat_id = CONFIG.get("telegram_chat_id", "").strip()
-        if old_chat_id:
-            chat_ids = [old_chat_id]
-        else:
-            return
-
+        return
+    
     icon = {"Kufar": "\U0001f7e1", "Realt.by": "\U0001f535", "Onliner": "\U0001f7e2"}.get(ad["source"], "\U0001f3e0")
     text = (
         f"{icon} *{ad['source']}* — новое объявление\n"
@@ -386,7 +387,7 @@ def notify_telegram(ad: dict):
         f"\U0001f4b0 {ad['price']}\n"
         f"\U0001f517 [Открыть]({ad['url']})"
     )
-
+    
     for chat_id in chat_ids:
         try:
             requests.post(
